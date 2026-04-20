@@ -1,7 +1,9 @@
 package org.openmrs.module.labonfhir.api.service.impl;
 
+import java.util.Date;
 import java.util.List;
 
+import org.openmrs.Order;
 import org.openmrs.api.APIException;
 import org.openmrs.module.labonfhir.api.dao.LabOnFhirDao;
 import org.openmrs.module.labonfhir.api.model.FailedTask;
@@ -54,5 +56,20 @@ public class LabOnFhirServiceImpl implements LabOnFhirService{
     public TaskRequest saveOrUpdateTaskRequest(TaskRequest taskRequest) throws APIException {
         return dao.saveOrUpdateTaskRequest(taskRequest);
     }
-    
+
+    @Override
+    public List<Order> getStaleOrders(Date cutoffDate) throws APIException {
+        return dao.getStaleOrders(cutoffDate);
+    }
+
+    @Override
+    public List<Order> getOrdersWithAccessionNumberAndNoScheduledDate() throws APIException {
+        return dao.getOrdersWithAccessionNumberAndNoScheduledDate();
+    }
+
+    @Override
+    public int updateOrderScheduledDate(String accessionNumber, Date scheduledDate) throws APIException {
+        return dao.updateOrderScheduledDate(accessionNumber, scheduledDate);
+    }
+
 }

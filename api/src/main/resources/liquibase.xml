@@ -86,6 +86,29 @@
             <column name="uuid" value="ae35121c-41e6-46f1-b2a2-0d9d2fa63e74" />
         </insert>
     </changeSet>
+    <changeSet id="create-send-vl-request-notifications-task-2026-03-25" author="aziz" dbms="mysql">
+        <preConditions onFail="MARK_RAN">
+            <sqlCheck expectedResult="0">
+                SELECT COUNT(*) FROM scheduler_task_config
+                WHERE schedulable_class = 'org.openmrs.module.labonfhir.api.scheduler.SendVLRequestNotifications'
+                And name = 'Send VL Request Notifications'
+            </sqlCheck>
+        </preConditions>
+        <comment>Inserting SendVLRequestNotifications Task into 'scheduler_task_config' table</comment>
+        <insert tableName="scheduler_task_config">
+            <column name="name" value="Send VL Request Notifications" />
+            <column name="description" value="Sends orders with accession number and no scheduled date to the VL server and updates their scheduled date" />
+            <column name="schedulable_class" value="org.openmrs.module.labonfhir.api.scheduler.SendVLRequestNotifications" />
+            <column name="start_time_pattern" value="MM/dd/yyyy HH:mm:ss" />
+            <column name="start_time" valueDate="now()" />
+            <column name="repeat_interval" value="300" />
+            <column name="date_created" valueDate="CURRENT_TIMESTAMP" />
+            <column name="created_by" value="1" />
+            <column name="start_on_startup" value="1"/>
+            <column name="started" value="0"/>
+            <column name="uuid" value="b3f2a1c4-5d6e-47f8-9a0b-1c2d3e4f5a6b" />
+        </insert>
+    </changeSet>
      <changeSet id="create-task-request-table-2023-08-24" author="mozzymutesa" dbms="mysql">
 		<preConditions onFail="MARK_RAN">
 			<not><tableExists tableName="task_request"/></not>

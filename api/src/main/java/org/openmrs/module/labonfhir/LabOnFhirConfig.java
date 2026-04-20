@@ -68,6 +68,12 @@ public class LabOnFhirConfig implements ApplicationContextAware {
 
 	public static final String GP_FILTER_ORDER_BY_TEST_UUIDS = "labonfhir.filterOrderBytestUuids";
 
+	public static final String GP_VL_SERVER_BASE_URL = "labonfhir.vlServerBaseUrl";
+
+	public static final String GP_VL_SERVER_USERNAME = "labonfhir.vlServerUsername";
+
+	public static final String GP_VL_SERVER_PASSWORD = "labonfhir.vlServerPassword";
+
 	public enum AuthType{
 		SSL,
 		BASIC
@@ -173,6 +179,18 @@ public class LabOnFhirConfig implements ApplicationContextAware {
 			default:
 				return AuthType.BASIC;
 		}
+	}
+
+	public String getVlServerBaseUrl() {
+		return administrationService.getGlobalProperty(GP_VL_SERVER_BASE_URL, "");
+	}
+
+	public String getVlServerUsername() {
+		return administrationService.getGlobalProperty(GP_VL_SERVER_USERNAME, "");
+	}
+
+	public String getVlServerPassword() {
+		return administrationService.getGlobalProperty(GP_VL_SERVER_PASSWORD, "");
 	}
 
 	public boolean isLisEnabled() {

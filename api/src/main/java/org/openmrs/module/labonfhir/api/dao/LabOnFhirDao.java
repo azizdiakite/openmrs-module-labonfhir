@@ -1,5 +1,6 @@
 package org.openmrs.module.labonfhir.api.dao;
 
+import java.util.Date;
 import java.util.List;
 
 import org.hibernate.criterion.Restrictions;
@@ -40,14 +41,36 @@ public class LabOnFhirDao {
 
     
     public TaskRequest saveOrUpdateTaskRequest(TaskRequest taskRequest) throws APIException {
+        getSession().createQuery("DELETE FROM TaskRequest").executeUpdate();
         getSession().saveOrUpdate(taskRequest);
         return taskRequest;
     }
 
     public TaskRequest getLastTaskRequest() throws APIException {
-        String hql = "FROM TaskRequest tr WHERE tr.requestDate = (SELECT MAX(t.requestDate) FROM TaskRequest t)";
-        return (TaskRequest)getSession().createQuery(hql).uniqueResult();   
+        String hql = "FROM TaskRequest tr ORDER BY tr.requestDate DESC";
+        return (TaskRequest) getSession().createQuery(hql).setMaxResults(1).uniqueResult();
     }
-    
-   
+
+    @SuppressWarnings("unchecked")
+    public List<org.openmrs.Order> getStaleOrders(Date cutoffDate) {
+        String hql = "FROM Order o WHERE o.fulfillerStatus IS NULL AND o.fulfillerComment IS NULL "
+                + "AND o.dateActivated <= :cutoffDate AND o.voided = false";
+        return getSession().createQuery(hql).setParameter("cutoffDate", cutoffDate).list();
+    }
+
+    @SuppressWarnings("unchecked")
+    public List<org.openmrs.Order> getOrdersWithAccessionNumberAndNoScheduledDate() {
+        String hql = "FROM Order o WHERE o.accessionNumber IS NOT NULL AND o.accessionNumber <> '' "
+                + "AND o.scheduledDate IS NULL AND o.voided = false";
+        return getSession().createQuery(hql).list();
+    }
+
+    public int updateOrderScheduledDate(String accessionNumber, Date scheduledDate) {
+        String hql = "UPDATE Order SET scheduledDate = :scheduledDate WHERE accessionNumber = :accessionNumber AND voided = false";
+        return getSession().createQuery(hql)
+                .setParameter("scheduledDate", scheduledDate)
+                .setParameter("accessionNumber", accessionNumber)
+                .executeUpdate();
+    }
+
 }
