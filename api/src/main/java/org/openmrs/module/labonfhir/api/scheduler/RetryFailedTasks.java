@@ -9,6 +9,7 @@ import org.apache.commons.logging.LogFactory;
 import org.hl7.fhir.instance.model.api.IBaseResource;
 import org.hl7.fhir.r4.model.Bundle;
 import org.hl7.fhir.r4.model.Task;
+import org.openmrs.Order;
 import org.openmrs.module.fhir2.api.FhirTaskService;
 import org.openmrs.module.fhir2.api.search.param.TaskSearchParams;
 import org.openmrs.module.labonfhir.api.event.OrderCreationListener;
@@ -100,11 +101,37 @@ public class RetryFailedTasks extends AbstractTask implements ApplicationContext
         failedTasks.forEach(failedTask -> {
             Task task = fhirTaskService.get(failedTask.getTaskUuid());
             if (task == null) {
+                // Task disappeared locally — nothing left to retry.
+                failedTask.setIsSent(true);
+                failedTask.setError("Local task no longer exists");
+                labOnFhirService.saveOrUpdateFailedTask(failedTask);
                 return;
             }
+
+            // Guard: only retry tasks that are still in REQUESTED. If the local task
+            // has moved forward (ACCEPTED / INPROGRESS / COMPLETED / ...), the hub
+            // has already picked it up — retrying would PUT a stale REQUESTED state
+            // back on top and regress the workflow.
+            Task.TaskStatus status = task.getStatus();
+            if (status != Task.TaskStatus.REQUESTED) {
+                log.info("Skipping retry for task " + failedTask.getTaskUuid()
+                        + " - local status is " + status);
+                failedTask.setIsSent(true);
+                labOnFhirService.saveOrUpdateFailedTask(failedTask);
+                return;
+            }
+
             try {
-                Bundle labBundle = orderCreationListener.createLabBundle(task);
+                // isRetry = true -> the Task entry uses POST + If-None-Exist so a
+                // retry that races with successful hub progression cannot overwrite
+                // an already-advanced Task.
+                Bundle labBundle = orderCreationListener.createLabBundle(task, true);
                 client.transaction().withBundle(labBundle).execute();
+
+                // Hub accepted the bundle. Mirror "Envoyé" on the Order immediately.
+                orderCreationListener.setOrderFulfillerStatus(task,
+                        Order.FulfillerStatus.RECEIVED, "REQUESTED");
+
                 failedTask.setIsSent(true);
                 labOnFhirService.saveOrUpdateFailedTask(failedTask);
                 log.info("Resent Failed task:" + failedTask.getTaskUuid());

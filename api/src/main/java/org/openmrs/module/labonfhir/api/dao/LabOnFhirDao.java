@@ -1,12 +1,15 @@
 package org.openmrs.module.labonfhir.api.dao;
 
+import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
 
+import org.hibernate.criterion.Projections;
 import org.hibernate.criterion.Restrictions;
 import org.openmrs.api.APIException;
 import org.openmrs.api.db.hibernate.DbSession;
 import org.openmrs.api.db.hibernate.DbSessionFactory;
+import org.openmrs.module.fhir2.model.FhirTask;
 import org.openmrs.module.labonfhir.api.model.FailedTask;
 import org.openmrs.module.labonfhir.api.model.TaskRequest;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -73,4 +76,26 @@ public class LabOnFhirDao {
                 .executeUpdate();
     }
 
+    /**
+     * Returns the UUIDs of local FHIR tasks that are still in flight and whose status
+     * should be polled from the FHIR hub. Used by FetchTaskUpdates to scope the remote
+     * search to tasks this specific instance emitted, instead of scanning every task
+     * the hub knows about (which on a 200+ instance shared hub is prohibitively large).
+     *
+     * Excludes terminal states (COMPLETED, REJECTED) and UNKNOWN — fhir2 2.2.0's
+     * FhirTask.TaskStatus enum only exposes REQUESTED / REJECTED / ACCEPTED / COMPLETED
+     * / UNKNOWN, and any FHIR status it cannot map (RECEIVED, INPROGRESS, CANCELLED)
+     * is translated to UNKNOWN on write — so once a task lands on UNKNOWN the
+     * authoritative state lives on the hub / Order.fulfillerStatus.
+     */
+    @SuppressWarnings("unchecked")
+    public List<String> getActiveTaskUuids() {
+        return getSession().createCriteria(FhirTask.class)
+                .add(Restrictions.not(Restrictions.in("status", Arrays.asList(
+                        FhirTask.TaskStatus.COMPLETED,
+                        FhirTask.TaskStatus.REJECTED,
+                        FhirTask.TaskStatus.UNKNOWN))))
+                .setProjection(Projections.property("uuid"))
+                .list();
+    }
 }
