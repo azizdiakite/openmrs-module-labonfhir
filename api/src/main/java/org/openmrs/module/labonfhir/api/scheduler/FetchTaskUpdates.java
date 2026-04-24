@@ -47,7 +47,6 @@ import org.springframework.stereotype.Component;
 
 import ca.uhn.fhir.rest.client.api.IGenericClient;
 import ca.uhn.fhir.rest.gclient.TokenClientParam;
-import ca.uhn.fhir.rest.param.DateRangeParam;
 import ca.uhn.fhir.rest.server.exceptions.ResourceNotFoundException;
 import lombok.AccessLevel;
 import lombok.Setter;
@@ -72,6 +71,9 @@ public class FetchTaskUpdates extends AbstractTask implements ApplicationContext
 	private static final Integer MAX_PAGES_PER_EXECUTION = 5;
 
 	private static final Integer STALE_ORDER_THRESHOLD_MINUTES = 30;
+
+	/** Max number of task UUIDs per remote search, chosen to stay well below HAPI's URL length limits. */
+	private static final int UUID_BATCH_SIZE = 100;
 
 	private static final String[] TASK_ELEMENTS = {
 	        "id", "identifier", "status", "statusReason", "output","ServiceRequest", "DiagnosticReport",
@@ -116,38 +118,50 @@ public class FetchTaskUpdates extends AbstractTask implements ApplicationContext
 		try {
 			log.info("******* START EXECUTING FetchTaskUpdatesOptimized Task ****** ");
 			Date newDate = new Date();
-			Calendar calendar = Calendar.getInstance();
-			calendar.setTime(newDate);
-			calendar.add(Calendar.YEAR, -5);
-			Date fiveYearsAgo = calendar.getTime();
-			String practitionerId = config.getLisUserUuid();
 
-			TaskRequest lastRequest = labOnFhirService.getLastTaskRequest();
-			Date lastRequestDate = (lastRequest != null) ? lastRequest.getRequestDate() : fiveYearsAgo;
+			// Scope the hub search to the UUIDs this instance emitted. Replaces the
+			// previous "filter by Task.OWNER" approach, which did not filter at all
+			// when multiple instances share the same lisUserUuid on a consolidated hub.
+			List<String> activeUuids = labOnFhirService.getActiveTaskUuids();
+			if (activeUuids.isEmpty()) {
+				log.info("FetchTaskUpdates: no active local tasks, nothing to fetch.");
+				TaskRequest request = new TaskRequest();
+				request.setRequestDate(newDate);
+				labOnFhirService.saveOrUpdateTaskRequest(request);
+				declineStaleOrders();
+				return;
+			}
 
-			DateRangeParam lastUpdated = new DateRangeParam().setLowerBoundInclusive(lastRequestDate);
-
-			Bundle taskBundle = client.search().forResource(Task.class)
-			        .lastUpdated(lastUpdated)
-					.where(Task.OWNER.hasId(practitionerId))
-			        .count(FETCH_TASK_LIMIT)
-			        .elementsSubset(TASK_ELEMENTS)
-			        .returnBundle(Bundle.class).execute();
+			log.info("FetchTaskUpdates: polling hub for " + activeUuids.size() + " active tasks");
 
 			int pagesProcessed = 0;
-			do {
-				processBundle(taskBundle);
-				pagesProcessed++;
-				if (pagesProcessed >= MAX_PAGES_PER_EXECUTION) {
-					log.info("FetchTaskUpdates: reached max pages per execution (" + MAX_PAGES_PER_EXECUTION + "), will resume next cycle.");
-					break;
-				}
-				if (taskBundle.getLink(IBaseBundle.LINK_NEXT) != null) {
-					taskBundle = client.loadPage().next(taskBundle).execute();
-				} else {
-					break;
-				}
-			} while (true);
+			boolean pageCapReached = false;
+			for (int i = 0; i < activeUuids.size() && !pageCapReached; i += UUID_BATCH_SIZE) {
+				List<String> batch = activeUuids.subList(i,
+						Math.min(i + UUID_BATCH_SIZE, activeUuids.size()));
+
+				Bundle taskBundle = client.search().forResource(Task.class)
+				        .where(new TokenClientParam("_id").exactly().codes(batch))
+				        .count(FETCH_TASK_LIMIT)
+				        .elementsSubset(TASK_ELEMENTS)
+				        .returnBundle(Bundle.class).execute();
+
+				do {
+					processBundle(taskBundle);
+					pagesProcessed++;
+					if (pagesProcessed >= MAX_PAGES_PER_EXECUTION) {
+						log.info("FetchTaskUpdates: reached max pages per execution ("
+								+ MAX_PAGES_PER_EXECUTION + "), will resume next cycle.");
+						pageCapReached = true;
+						break;
+					}
+					if (taskBundle.getLink(IBaseBundle.LINK_NEXT) != null) {
+						taskBundle = client.loadPage().next(taskBundle).execute();
+					} else {
+						break;
+					}
+				} while (true);
+			}
 
 			TaskRequest request = new TaskRequest();
 			request.setRequestDate(newDate);
@@ -221,17 +235,20 @@ public class FetchTaskUpdates extends AbstractTask implements ApplicationContext
 			}
 			if (openelisTask.hasOutput()) {
 				setLabDates(openelisTask.getOutput(), currentOrder);
-				boolean outputUpdated = updateOutput(openelisTask.getOutput(), openmrsTask);
-				if (outputUpdated) {
-					taskService.update(openmrsTaskUuid, openmrsTask);
-					return true;
-				}
+				updateOutput(openelisTask.getOutput(), openmrsTask);
 			}
-			return false;
+			// Always persist COMPLETED locally, even when updateOutput returned false
+			// (observations already imported on a previous tick, or output missing LOINC
+			// code). If we don't, the local task stays at its previous status, stays in
+			// getActiveTaskUuids(), gets re-polled every cycle, and RetryFailedTasks may
+			// re-PUT a REQUESTED bundle on top of the completed hub task.
+			taskService.update(openmrsTaskUuid, openmrsTask);
+			return true;
 		}
 
 		if (Task.TaskStatus.REJECTED.equals(status)) {
 			openmrsTask.setStatus(status);
+			taskService.update(openmrsTaskUuid, openmrsTask);
 			String commentText = "Update Order with remote fhir status";
 			if (openelisTask.hasStatusReason() && openelisTask.getStatusReason().hasText()
 			        && !openelisTask.getStatusReason().getText().isEmpty()) {
@@ -245,30 +262,56 @@ public class FetchTaskUpdates extends AbstractTask implements ApplicationContext
 	}
 
 	/**
-	 * Handles simple status transitions (REQUESTED, ACCEPTED, INPROGRESS, CANCELLED).
+	 * Handles simple status transitions (REQUESTED, RECEIVED, ACCEPTED, INPROGRESS, CANCELLED).
 	 * All needed data comes from the local openmrsTask – no remote field is required.
+	 *
+	 * Important: once the hub confirms the task has left REQUESTED (any of RECEIVED,
+	 * ACCEPTED, INPROGRESS, CANCELLED), we MUST persist a status change on the local
+	 * FhirTask. Otherwise RetryFailedTasks' rebroadcast scan ("SELECT * WHERE status =
+	 * REQUESTED") will keep picking up the task and re-PUT a REQUESTED bundle onto the
+	 * hub, clobbering its actual state and flipping the UI back to "Envoyé".
+	 *
+	 * fhir2 1.x / 2.2.0 only exposes REQUESTED, REJECTED, ACCEPTED, COMPLETED, UNKNOWN
+	 * on FhirTask.TaskStatus. Non-representable hub statuses (RECEIVED, INPROGRESS,
+	 * CANCELLED) are collapsed onto ACCEPTED locally — still wrong granularity, but
+	 * enough to signal "no longer REQUESTED" and stop the retry loop. UI granularity
+	 * continues to live on Order.fulfillerStatus + fulfillerComment.
 	 */
 	private boolean processSimpleStatus(Task.TaskStatus status, Task openmrsTask) {
+		String openmrsTaskUuid = openmrsTask.getIdElement().getIdPart();
+
 		if (Task.TaskStatus.REQUESTED.equals(status)) {
-			openmrsTask.setStatus(status);
+			// Already our initial local state — no Task update needed, just mirror on Order.
+			setOrderStatus(openmrsTask.getBasedOn(), Order.FulfillerStatus.RECEIVED,
+			    TaskStatus.REQUESTED.toString());
+			return true;
+		}
+		if (Task.TaskStatus.RECEIVED.equals(status)) {
+			// Transient hub state between SIGDEP POST and OpenELIS pickup. Move the
+			// local Task out of REQUESTED so it stops being a retry candidate.
+			openmrsTask.setStatus(Task.TaskStatus.ACCEPTED);
+			taskService.update(openmrsTaskUuid, openmrsTask);
 			setOrderStatus(openmrsTask.getBasedOn(), Order.FulfillerStatus.RECEIVED,
 			    TaskStatus.REQUESTED.toString());
 			return true;
 		}
 		if (Task.TaskStatus.ACCEPTED.equals(status)) {
 			openmrsTask.setStatus(status);
+			taskService.update(openmrsTaskUuid, openmrsTask);
 			setOrderStatus(openmrsTask.getBasedOn(), Order.FulfillerStatus.RECEIVED,
 			    TaskStatus.ACCEPTED.toString());
 			return true;
 		}
 		if (Task.TaskStatus.INPROGRESS.equals(status)) {
-			openmrsTask.setStatus(status);
+			openmrsTask.setStatus(Task.TaskStatus.ACCEPTED);
+			taskService.update(openmrsTaskUuid, openmrsTask);
 			setOrderStatus(openmrsTask.getBasedOn(), Order.FulfillerStatus.IN_PROGRESS,
 			    TaskStatus.INPROGRESS.toString());
 			return true;
 		}
 		if (Task.TaskStatus.CANCELLED.equals(status)) {
-			openmrsTask.setStatus(status);
+			openmrsTask.setStatus(Task.TaskStatus.ACCEPTED);
+			taskService.update(openmrsTaskUuid, openmrsTask);
 			setOrderStatus(openmrsTask.getBasedOn(), Order.FulfillerStatus.EXCEPTION,
 			    TaskStatus.CANCELLED.toString());
 			return true;
@@ -397,7 +440,12 @@ public class FetchTaskUpdates extends AbstractTask implements ApplicationContext
 			try {
 				Order order = orderService.getOrderByUuid(serviceRequestUuid);
 				if (order != null) {
-					orderService.updateOrderFulfillerStatus(order, fulfillerStatus, commentText, "");
+					// Pass null (not "") so OrderServiceImpl leaves the accession number
+					// untouched. Passing "" would overwrite an existing accession number
+					// that setOrderNumberFromLIS may have already populated in a previous
+					// cycle (OrderServiceImpl sets the field only when the argument is
+					// non-null).
+					orderService.updateOrderFulfillerStatus(order, fulfillerStatus, commentText, null);
 				}
 			}
 			catch (ResourceNotFoundException e) {
@@ -480,7 +528,24 @@ public class FetchTaskUpdates extends AbstractTask implements ApplicationContext
 			List<Order> staleOrders = labOnFhirService.getStaleOrders(cutoffDate);
 			for (Order order : staleOrders) {
 				try {
-					orderService.updateOrderFulfillerStatus(order, Order.FulfillerStatus.EXCEPTION, "DECLINED", "");
+					// Pass null (not "") so we don't wipe a hypothetical accession number.
+					orderService.updateOrderFulfillerStatus(order, Order.FulfillerStatus.EXCEPTION, "DECLINED", null);
+
+					// Move the matching local FHIR Task out of REQUESTED so RetryFailedTasks
+					// can't pick it up and re-PUT a REQUESTED bundle that would overwrite the
+					// EXCEPTION/DECLINED we just set on the Order.
+					try {
+						Task localTask = taskService.get(order.getUuid());
+						if (localTask != null && Task.TaskStatus.REQUESTED.equals(localTask.getStatus())) {
+							localTask.setStatus(Task.TaskStatus.REJECTED);
+							taskService.update(order.getUuid(), localTask);
+						}
+					}
+					catch (Exception taskErr) {
+						log.warn("Could not update local Task for declined order " + order.getUuid()
+						        + ": " + taskErr.getMessage());
+					}
+
 					log.info("Marked stale order " + order.getUuid() + " as EXCEPTION/DECLINED");
 				}
 				catch (Exception e) {

@@ -92,4 +92,15 @@ public interface LabOnFhirService extends OpenmrsService{
 	@Transactional
 	int updateOrderScheduledDate(String accessionNumber, Date scheduledDate) throws APIException;
 
+	/**
+	 * Returns UUIDs of local FHIR tasks that are still in flight (not terminal, not
+	 * UNKNOWN). Used by FetchTaskUpdates to narrow the hub search to tasks this
+	 * instance actually emitted, cutting cross-instance traffic on a shared hub.
+	 *
+	 * @return list of FHIR task UUIDs
+	 * @throws APIException
+	 */
+	@Transactional(readOnly = true)
+	List<String> getActiveTaskUuids() throws APIException;
+
 }

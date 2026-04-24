@@ -72,4 +72,9 @@ public class LabOnFhirServiceImpl implements LabOnFhirService{
         return dao.updateOrderScheduledDate(accessionNumber, scheduledDate);
     }
 
+    @Override
+    public List<String> getActiveTaskUuids() throws APIException {
+        return dao.getActiveTaskUuids();
+    }
+
 }

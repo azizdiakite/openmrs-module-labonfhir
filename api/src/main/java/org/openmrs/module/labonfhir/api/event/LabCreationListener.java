@@ -11,9 +11,13 @@ import ca.uhn.fhir.rest.client.api.IGenericClient;
 import ca.uhn.fhir.rest.param.TokenAndListParam;
 import ca.uhn.fhir.rest.param.TokenParam;
 import org.hl7.fhir.instance.model.api.IBaseResource;
+import org.hl7.fhir.instance.model.api.IIdType;
 import org.hl7.fhir.r4.model.Bundle;
+import org.hl7.fhir.r4.model.Reference;
 import org.hl7.fhir.r4.model.Resource;
 import org.hl7.fhir.r4.model.Task;
+import org.openmrs.Order;
+import org.openmrs.api.OrderService;
 import org.openmrs.api.context.Daemon;
 import org.openmrs.event.EventListener;
 import org.openmrs.module.DaemonToken;
@@ -55,6 +59,9 @@ public abstract class LabCreationListener implements EventListener {
 	@Autowired
 	private LabOnFhirService labOnFhirService ;
 
+	@Autowired
+	private OrderService orderService;
+
 	public DaemonToken getDaemonToken() {
 		return daemonToken;
 	}
@@ -80,6 +87,18 @@ public abstract class LabCreationListener implements EventListener {
 	public abstract void processMessage(Message message);
 
 	public Bundle createLabBundle(Task task) {
+		return createLabBundle(task, false);
+	}
+
+	/**
+	 * Build a transaction bundle for the given Task.
+	 *
+	 * When {@code isRetry} is true, the Task entry uses POST + If-None-Exist so a retry
+	 * cannot overwrite a Task that the hub has already progressed past REQUESTED. Other
+	 * resources (Patient, Encounter, ServiceRequest, Location) stay as PUTs since they
+	 * are safe to re-upsert.
+	 */
+	public Bundle createLabBundle(Task task, boolean isRetry) {
 		TokenAndListParam uuid = new TokenAndListParam().addAnd(new TokenParam(task.getIdElement().getIdPart()));
 		HashSet<Include> includes = new HashSet<>();
 		includes.add(new Include("Task:patient"));
@@ -99,25 +118,64 @@ public abstract class LabCreationListener implements EventListener {
 			Resource resource = (Resource) r;
 			Bundle.BundleEntryComponent component = transactionBundle.addEntry();
 			component.setResource(resource);
-			component.getRequest().setUrl(resource.fhirType() + "/" + resource.getIdElement().getIdPart())
-			        .setMethod(Bundle.HTTPVerb.PUT);
 
+			if (resource instanceof Task && isRetry) {
+				// Conditional create: the hub creates the Task only if no Task with this id
+				// exists yet. Otherwise it returns the existing one untouched, which is what
+				// we want for a retry (never regress a Task the hub already moved forward).
+				component.getRequest()
+						.setMethod(Bundle.HTTPVerb.POST)
+						.setUrl(resource.fhirType())
+						.setIfNoneExist("_id=" + resource.getIdElement().getIdPart());
+			} else {
+				component.getRequest()
+						.setUrl(resource.fhirType() + "/" + resource.getIdElement().getIdPart())
+						.setMethod(Bundle.HTTPVerb.PUT);
+			}
 		}
 		return transactionBundle;
 	}
 
 	protected void sendTask(Task task) {
-		if (task != null) {
-			if (config.getActivateFhirPush()) {
-				try {
-					Bundle labBundle = createLabBundle(task);
-					client.transaction().withBundle(labBundle).execute();
-					log.debug(ctx.newJsonParser().setPrettyPrint(true).encodeResourceToString(labBundle));
-				}
-				catch (Exception e) {
-					saveFailedTask(task.getIdElement().getIdPart(), e.getMessage());
-					log.error("Failed to send Task with UUID " + task.getIdElement().getIdPart(), e);
-				}
+		if (task == null || !config.getActivateFhirPush()) {
+			return;
+		}
+
+		Bundle labBundle = createLabBundle(task);
+		try {
+			client.transaction().withBundle(labBundle).execute();
+			// 201 received. The Task is now live on the hub with status REQUESTED.
+			// Reflect this on the Order right away so the UI shows "Envoyé" without
+			// waiting for the next FetchTaskUpdates cycle.
+			setOrderFulfillerStatus(task, Order.FulfillerStatus.RECEIVED, "REQUESTED");
+			log.debug(ctx.newJsonParser().setPrettyPrint(true).encodeResourceToString(labBundle));
+		}
+		catch (Exception e) {
+			saveFailedTask(task.getIdElement().getIdPart(), e.getMessage());
+			log.error("Failed to send Task with UUID " + task.getIdElement().getIdPart(), e);
+		}
+	}
+
+	/**
+	 * Apply a fulfiller status / comment on every Order referenced in the Task's
+	 * basedOn list. Silently skips references that don't resolve to a local Order.
+	 */
+	public void setOrderFulfillerStatus(Task task, Order.FulfillerStatus status, String comment) {
+		if (task == null || task.getBasedOn() == null) {
+			return;
+		}
+		for (Reference ref : task.getBasedOn()) {
+			if (!ref.hasReferenceElement()) {
+				continue;
+			}
+			IIdType refElement = ref.getReferenceElement();
+			if (!"ServiceRequest".equals(refElement.getResourceType())) {
+				continue;
+			}
+			Order order = orderService.getOrderByUuid(refElement.getIdPart());
+			if (order != null) {
+				orderService.updateOrderFulfillerStatus(order, status, comment,
+						order.getAccessionNumber());
 			}
 		}
 	}
